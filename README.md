@@ -78,7 +78,76 @@ Our evaluation involves many third-party packages, and we include some useful ev
 
 ### Train
 
-You can also ```train.py``` on single GPU training and ```train_ddp.py``` for multiple GPT training.
+You can also use ```train.py``` for single GPU training and ```train_ddp.py``` for multiple GPU training.
+
+### Training on Google Cloud Vertex AI
+
+This project includes tools to run training jobs on Google Cloud Vertex AI, leveraging spot VMs for cost efficiency and GCS for dataset and checkpoint management.
+
+**1. Prerequisites:**
+
+*   **Google Cloud Project:** You need a Google Cloud Project with billing enabled.
+*   **Enable APIs:** Ensure the following APIs are enabled in your project:
+    *   Vertex AI API
+    *   Artifact Registry API
+    *   Cloud Build API (optional, if you build containers using Cloud Build)
+*   **IAM Permissions:** The service account used by Vertex AI Custom Jobs (or your user account if running `gcloud` commands locally) needs appropriate permissions:
+    *   `Vertex AI User` or `Vertex AI Administrator` role for managing Vertex AI jobs.
+    *   `Artifact Registry Writer` (or `roles/artifactregistry.writer`) to push Docker images to Artifact Registry.
+    *   `Storage Object Admin` (or `roles/storage.objectAdmin`) on the GCS buckets used for:
+        *   Storing checkpoints.
+        *   Storing the LMDB dataset.
+*   **Google Cloud SDK:** Install and initialize the `gcloud` CLI.
+*   **Docker:** Docker must be installed locally to build and push the container image.
+
+**2. Data Preparation for Vertex AI Training:**
+
+The training script `train.py` is configured to load LMDB datasets. For Vertex AI, these datasets should be stored in Google Cloud Storage (GCS).
+
+*   **Download and Extract LMDB Dataset:**
+    *   Download the `PepMerge_lmdb.zip` (or your custom LMDB dataset) from the link provided in the "Data and Weights Download" section.
+    *   Extract the zip file. You should have one or more `.lmdb` files (e.g., `train_structure_cache.lmdb`, `val_structure_cache.lmdb`).
+*   **Upload LMDB Files to GCS:**
+    *   Create a GCS bucket (or use an existing one).
+    *   Upload your LMDB files to a directory within this bucket. For example, if your bucket is `my-pepflow-bucket` and you want to store the LMDBs under `datasets/lmdb/`, you would upload them there:
+        ```bash
+        # Example: Uploading a directory containing train.lmdb, val.lmdb etc.
+        gsutil -m cp -r path/to/your/extracted_lmdb_files/ gs://my-pepflow-bucket/datasets/lmdb/
+        # Ensure individual files like train_structure_cache.lmdb are directly under the GCS path you'll specify.
+        # For example, after upload, you should have:
+        # gs://my-pepflow-bucket/datasets/lmdb/train_structure_cache.lmdb
+        # gs://my-pepflow-bucket/datasets/lmdb/val_structure_cache.lmdb (if using validation)
+        ```
+
+**3. Configure the Submission Script:**
+
+The `submit_job.sh` script is used to build the Docker image, push it to Artifact Registry, and submit the training job to Vertex AI.
+
+*   Open `submit_job.sh` and edit the **CONFIGURATION** section:
+    *   `PROJECT_ID`: Your Google Cloud Project ID.
+    *   `REGION`: The Google Cloud region where you want to run Vertex AI jobs and store artifacts (e.g., `us-central1`).
+    *   `GCS_BUCKET_NAME`: The name of your GCS bucket used for **storing checkpoints** (do not include `gs://` prefix). The script will create a subdirectory for checkpoints.
+    *   `ARTIFACT_REGISTRY_REPO`: The name of your Artifact Registry repository where the Docker image will be stored. Create one if it doesn't exist (e.g., `pepflow-repo`).
+    *   `IMAGE_NAME`: Name for your Docker image (default: `pepflow-trainer`).
+    *   `IMAGE_TAG`: Tag for your Docker image (default: `latest`).
+    *   `GCS_LMDB_DATA_DIR`: **Crucial for data loading.** The full GCS path to the directory containing your LMDB dataset files (e.g., `"gs://my-pepflow-bucket/datasets/lmdb/"`). Make sure this path ends with a trailing slash.
+    *   `TRAIN_LMDB_FILENAME`: The filename of your main training LMDB file located in `GCS_LMDB_DATA_DIR` (e.g., `"train_structure_cache.lmdb"`).
+    *   *(Optional)* `VAL_LMDB_FILENAME`: If you intend to use a validation LMDB dataset and have modified `train.py` to load it, specify its filename here.
+
+**4. Run the Training Job:**
+
+*   Ensure you are authenticated with gcloud and Docker is configured for Artifact Registry (the script attempts to do this via `gcloud auth configure-docker`).
+*   Make the script executable: `chmod +x submit_job.sh`
+*   Execute the script:
+    ```bash
+    ./submit_job.sh
+    ```
+    This will:
+    1.  Build the Docker image using `Dockerfile`.
+    2.  Push the image to your Artifact Registry.
+    3.  Submit a custom training job to Vertex AI using the specified configuration (A100 GPU, spot VMs, GCS checkpointing, and GCS LMDB data path).
+
+You can monitor the job progress in the Google Cloud Console under Vertex AI > Training > Custom Jobs. Checkpoints will be saved to the GCS path specified by `GCS_CHECKPOINT_PATH` in the script. Logs will be available in Cloud Logging.
 
 
 ## Future Work

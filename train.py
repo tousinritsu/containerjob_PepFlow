@@ -36,10 +36,22 @@ if __name__ == '__main__':
     parser.add_argument('--resume', type=str, default=None)
     parser.add_argument('--name', type=str, default='pepflow')
     parser.add_argument('--checkpoint-dir', type=str, default=None, help='GCS path to save/load checkpoints (e.g., gs://bucket/path/to/checkpoints)')
+    parser.add_argument('--gcs_lmdb_dir', type=str, default=None, help='GCS directory path containing LMDB dataset files (e.g., gs://bucket/path/to/lmdb_files/)')
+    parser.add_argument('--train_lmdb_name', type=str, default='train_structure_cache.lmdb', help='Name of the training LMDB file (e.g., train.lmdb or train_structure_cache.lmdb)')
+    # parser.add_argument('--val_lmdb_name', type=str, default='val_structure_cache.lmdb', help='Name of the validation LMDB file') # Validation part is commented out
+    parser.add_argument('--local_lmdb_root', type=str, default='/tmp/pepflow_lmdb_data', help='Local directory to download LMDB files')
     args = parser.parse_args()
 
-    # GCS client
-    gcs_client = storage.Client() if args.checkpoint_dir and args.checkpoint_dir.startswith('gs://') else None
+    # GCS client (used for both checkpoints and potentially LMDB download)
+    # Initialize gcs_storage_client if either checkpoint_dir or gcs_lmdb_dir is a GCS path
+    gcs_storage_client = None
+    if (args.checkpoint_dir and args.checkpoint_dir.startswith('gs://')) or \
+       (args.gcs_lmdb_dir and args.gcs_lmdb_dir.startswith('gs://')):
+        gcs_storage_client = storage.Client()
+    else:
+        # This case is fine if only local paths are used or if GCS features are not used.
+        pass
+
 
     # Version control
     branch, version = get_version()
@@ -79,16 +91,69 @@ if __name__ == '__main__':
 
     # Data
     logger.info('Loading datasets...')
-    # train_dataset = get_dataset(config.dataset.train)
-    # val_dataset = get_dataset(config.dataset.val)
-    train_dataset = PepDataset(structure_dir = config.dataset.train.structure_dir, dataset_dir = config.dataset.train.dataset_dir,
-                                            name = config.dataset.train.name, transform=None, reset=config.dataset.train.reset)
+
+    train_structure_dir_to_pass = config.dataset.train.structure_dir
+    train_dataset_dir_to_pass = config.dataset.train.dataset_dir
+    train_name_to_pass = config.dataset.train.name
+    train_reset_to_pass = config.dataset.train.reset
+
+    if args.gcs_lmdb_dir and gcs_storage_client:
+        logger.info(f"Attempting to use LMDB dataset from GCS: {args.gcs_lmdb_dir}")
+        os.makedirs(args.local_lmdb_root, exist_ok=True)
+
+        train_lmdb_gcs_path = os.path.join(args.gcs_lmdb_dir, args.train_lmdb_name)
+        local_train_lmdb_path = os.path.join(args.local_lmdb_root, args.train_lmdb_name)
+
+        try:
+            bucket_name, blob_name = train_lmdb_gcs_path.replace("gs://", "").split("/", 1)
+            bucket = gcs_storage_client.bucket(bucket_name)
+            blob = bucket.blob(blob_name)
+
+            if os.path.exists(local_train_lmdb_path):
+                logger.info(f"LMDB file {local_train_lmdb_path} already exists locally. Skipping download.")
+            else:
+                logger.info(f"Downloading {train_lmdb_gcs_path} to {local_train_lmdb_path}...")
+                blob.download_to_filename(local_train_lmdb_path)
+                logger.info("Download complete.")
+
+            # For PepDataset, dataset_dir is the directory containing the .lmdb file
+            # name is the lmdb filename without the .lmdb extension
+            train_dataset_dir_to_pass = args.local_lmdb_root
+            train_name_to_pass = args.train_lmdb_name.replace('.lmdb', '')
+            # structure_dir can be a dummy path if LMDB is pre-generated and reset is False
+            # However, to be safe and align with PepDataset's expectation if it tries to list this dir for any reason:
+            train_structure_dir_to_pass = os.path.join(args.local_lmdb_root, "dummy_structure_dir")
+            os.makedirs(train_structure_dir_to_pass, exist_ok=True)
+            train_reset_to_pass = False # Always False when using pre-downloaded LMDB
+            logger.info(f"PepDataset params: dataset_dir='{train_dataset_dir_to_pass}', name='{train_name_to_pass}', structure_dir='{train_structure_dir_to_pass}', reset={train_reset_to_pass}")
+
+        except Exception as e:
+            logger.error(f"Failed to download or prepare LMDB from GCS: {e}. Falling back to config paths.")
+            # Fallback to config paths if GCS download fails
+            train_structure_dir_to_pass = config.dataset.train.structure_dir
+            train_dataset_dir_to_pass = config.dataset.train.dataset_dir
+            train_name_to_pass = config.dataset.train.name
+            train_reset_to_pass = config.dataset.train.reset
+
+
+    train_dataset = PepDataset(
+        structure_dir=train_structure_dir_to_pass,
+        dataset_dir=train_dataset_dir_to_pass,
+        name=train_name_to_pass,
+        transform=None,
+        reset=train_reset_to_pass
+    )
+
     # val_dataset = PepDataset(structure_dir = config.dataset.val.structure_dir, dataset_dir = config.dataset.val.dataset_dir,
     #                                         name = config.dataset.val.name, transform=None, reset=config.dataset.val.reset)
     train_loader = DataLoader(train_dataset, batch_size=config.train.batch_size, shuffle=True, collate_fn=PaddingCollate(), num_workers=args.num_workers, pin_memory=True)
     train_iterator = inf_iterator(train_loader)
     # val_loader = DataLoader(val_dataset, batch_size=config.train.batch_size, shuffle=False, collate_fn=PaddingCollate(), num_workers=args.num_workers)
-    logger.info('Train %d | Val %d' % (len(train_dataset), len(train_dataset)))
+
+    # Corrected logger info for dataset length
+    # logger.info('Train %d | Val %d' % (len(train_dataset), len(val_dataset if 'val_dataset' in locals() else 0)))
+    logger.info('Train dataset size: %d' % len(train_dataset))
+
 
     # Model
     logger.info('Building model...')

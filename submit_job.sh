@@ -46,6 +46,18 @@ MACHINE_TYPE="a2-ultragpu-1g" # As requested: a2-ultragpu-1g
 ACCELERATOR_TYPE="NVIDIA_A100_80GB"
 ACCELERATOR_COUNT=1
 
+# GCS path to the directory containing LMDB dataset files (e.g., "gs://your-bucket/datasets/pepflow_lmdb/")
+# Ensure this path ends with a trailing slash if it's a directory.
+GCS_LMDB_DATA_DIR="gs://your-gcs-bucket-name/path/to/your/lmdb_data_dir/"
+
+# Filename of the training LMDB dataset within the GCS_LMDB_DATA_DIR
+# (e.g., "train_structure_cache.lmdb" or "train.lmdb")
+TRAIN_LMDB_FILENAME="train_structure_cache.lmdb"
+
+# (Optional) Filename of the validation LMDB dataset, if used by train.py
+# VAL_LMDB_FILENAME="val_structure_cache.lmdb"
+
+
 # #############################################################################
 # SCRIPT LOGIC (generally, no changes needed below this line)
 # #############################################################################
@@ -95,10 +107,12 @@ gcloud ai custom-jobs create \
   --display-name=${JOB_DISPLAY_NAME} \
   --worker-pool-spec=machine-type=${MACHINE_TYPE},replica-count=1,container-image-uri=${IMAGE_URI},accelerator-type=${ACCELERATOR_TYPE},accelerator-count=${ACCELERATOR_COUNT} \
   --enable-spot-vm \
-  --args="--config=./configs/angle/learn_angle.yaml,--checkpoint-dir=${GCS_CHECKPOINT_PATH}" \
+  --args="--config=./configs/angle/learn_angle.yaml,--checkpoint-dir=${GCS_CHECKPOINT_PATH},--gcs_lmdb_dir=${GCS_LMDB_DATA_DIR},--train_lmdb_name=${TRAIN_LMDB_FILENAME}" \
   --labels=job-type=training,experiment=pepflow
 
 echo "Vertex AI Custom Training Job submitted."
+echo "GCS LMDB Data Directory used: ${GCS_LMDB_DATA_DIR}"
+echo "Train LMDB Filename used: ${TRAIN_LMDB_FILENAME}"
 echo "Job Name (for tracking): projects/${PROJECT_ID}/locations/${REGION}/customJobs/<JOB_ID>"
 echo "You can monitor the job in the Google Cloud Console (Vertex AI > Training > Custom Jobs)."
 echo "Checkpoints will be saved to: ${GCS_CHECKPOINT_PATH}"
