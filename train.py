@@ -4,6 +4,8 @@ import os
 import shutil
 import argparse
 import torch
+from google.cloud import storage
+import tempfile
 import torch.cuda.amp as amp
 import torch.distributed as distrib
 from torch.nn.utils import clip_grad_norm_
@@ -33,7 +35,11 @@ if __name__ == '__main__':
     parser.add_argument('--tag', type=str, default='')
     parser.add_argument('--resume', type=str, default=None)
     parser.add_argument('--name', type=str, default='pepflow')
+    parser.add_argument('--checkpoint-dir', type=str, default=None, help='GCS path to save/load checkpoints (e.g., gs://bucket/path/to/checkpoints)')
     args = parser.parse_args()
+
+    # GCS client
+    gcs_client = storage.Client() if args.checkpoint_dir and args.checkpoint_dir.startswith('gs://') else None
 
     # Version control
     branch, version = get_version()
@@ -97,16 +103,66 @@ if __name__ == '__main__':
     optimizer.zero_grad()
     it_first = 1
 
-    # Resume
-    if args.resume is not None:
-        logger.info('Resuming from checkpoint: %s' % args.resume)
-        ckpt = torch.load(args.resume, map_location=args.device)
-        it_first = ckpt['iteration']  # + 1
-        model.load_state_dict(ckpt['model'])
-        logger.info('Resuming optimizer states...')
-        optimizer.load_state_dict(ckpt['optimizer'])
-        logger.info('Resuming scheduler states...')
-        scheduler.load_state_dict(ckpt['scheduler'])
+    # Resume from local file or GCS
+    if args.resume is not None: # Prioritize direct --resume flag if provided (local path)
+        if os.path.exists(args.resume):
+            logger.info('Resuming from local checkpoint: %s' % args.resume)
+            ckpt = torch.load(args.resume, map_location=args.device)
+            it_first = ckpt['iteration'] + 1
+            model.load_state_dict(ckpt['model'])
+            if 'optimizer' in ckpt: optimizer.load_state_dict(ckpt['optimizer'])
+            if 'scheduler' in ckpt: scheduler.load_state_dict(ckpt['scheduler'])
+            logger.info(f'Resumed from iteration {it_first-1}')
+        else:
+            logger.warning(f"Local resume checkpoint not found: {args.resume}")
+
+    elif gcs_client and args.checkpoint_dir:
+        bucket_name, blob_prefix = args.checkpoint_dir.replace("gs://", "").split("/", 1)
+        bucket = gcs_client.bucket(bucket_name)
+        # List blobs and find the latest checkpoint
+        blobs = list(bucket.list_blobs(prefix=blob_prefix))
+        if blobs:
+            # Assuming checkpoint files are named like 'checkpoint_ITERATION.pt' or 'ITERATION.pt'
+            # Sort by iteration number (extracting from filename)
+            latest_blob = None
+            max_iteration = -1
+
+            for blob in blobs:
+                try:
+                    # Attempt to extract iteration number from filename, e.g., "checkpoint_1000.pt" or "1000.pt"
+                    filename = blob.name.split('/')[-1]
+                    iter_num_str = filename.replace("checkpoint_", "").replace(".pt", "")
+                    iteration = int(iter_num_str)
+                    if iteration > max_iteration:
+                        max_iteration = iteration
+                        latest_blob = blob
+                except ValueError:
+                    logger.warning(f"Could not parse iteration number from blob: {blob.name}")
+                    continue # Skip blobs with names not matching the expected format
+
+            if latest_blob:
+                logger.info(f'Found latest GCS checkpoint: {latest_blob.name} with iteration {max_iteration}')
+                with tempfile.NamedTemporaryFile(delete=False, suffix=".pt") as tmp_file:
+                    try:
+                        logger.info(f'Downloading GCS checkpoint: gs://{bucket_name}/{latest_blob.name} to {tmp_file.name}')
+                        latest_blob.download_to_filename(tmp_file.name)
+                        ckpt = torch.load(tmp_file.name, map_location=args.device)
+                        it_first = ckpt['iteration'] + 1
+                        model.load_state_dict(ckpt['model'])
+                        if 'optimizer' in ckpt: optimizer.load_state_dict(ckpt['optimizer'])
+                        if 'scheduler' in ckpt: scheduler.load_state_dict(ckpt['scheduler'])
+                        logger.info(f'Resumed from GCS checkpoint, iteration {it_first-1}')
+                    except Exception as e:
+                        logger.error(f"Error loading GCS checkpoint: {e}")
+                    finally:
+                        os.remove(tmp_file.name) # Clean up temporary file
+            else:
+                logger.info('No suitable checkpoints found in GCS to resume from.')
+        else:
+            logger.info('No checkpoints found in GCS to resume from.')
+    else:
+        logger.info('No resume path provided and no GCS checkpoint directory specified. Starting from scratch.')
+
 
     def train(it):
         time_start = current_milli_time()
@@ -190,16 +246,35 @@ if __name__ == '__main__':
             train(it)
             # if it % config.train.val_freq == 0:
             #     avg_val_loss = validate(it)
-                # if not args.debug:
-            if it % config.train.val_freq == 0:
-                ckpt_path = os.path.join(ckpt_dir, '%d.pt' % it)
-                torch.save({
+            if it % config.train.val_freq == 0 and not args.debug: # Avoid saving checkpoints in debug mode for GCS
+                checkpoint_data = {
                     'config': config,
                     'model': model.state_dict(),
                     'optimizer': optimizer.state_dict(),
                     'scheduler': scheduler.state_dict(),
                     'iteration': it,
-                    # 'avg_val_loss': avg_val_loss,
-                }, ckpt_path)
+                    # 'avg_val_loss': avg_val_loss, # If you have validation
+                }
+
+                # Save to local ckpt_dir first (as before)
+                local_ckpt_filename = '%d.pt' % it
+                local_ckpt_path = os.path.join(ckpt_dir, local_ckpt_filename)
+                torch.save(checkpoint_data, local_ckpt_path)
+                logger.info(f'Saved local checkpoint: {local_ckpt_path}')
+
+                # If GCS checkpointing is configured, upload to GCS
+                if gcs_client and args.checkpoint_dir:
+                    bucket_name, blob_prefix = args.checkpoint_dir.replace("gs://", "").split("/", 1)
+                    blob_name = os.path.join(blob_prefix, local_ckpt_filename) # e.g., path/to/checkpoints/1000.pt
+
+                    bucket = gcs_client.bucket(bucket_name)
+                    blob = bucket.blob(blob_name)
+
+                    try:
+                        blob.upload_from_filename(local_ckpt_path)
+                        logger.info(f'Uploaded checkpoint to GCS: gs://{bucket_name}/{blob_name}')
+                    except Exception as e:
+                        logger.error(f'Failed to upload checkpoint to GCS: {e}')
+
     except KeyboardInterrupt:
         logger.info('Terminating...')
